@@ -204,13 +204,14 @@ function makeTileGeometry(x, y, z) {
  var north = tileLat(y, z);
  var south = tileLat(y + 1, z);
  var segments = 8, positions = [], uvs = [], indices = [];
+ var surfaceRadius = 1.001 + z * 0.00005;
  for (var row = 0; row <= segments; row++) {
   var v = row / segments;
   var lat = north + (south - north) * v;
   for (var col = 0; col <= segments; col++) {
    var u = col / segments;
    var lon = west + (east - west) * u;
-   var p = tilePoint(lat, lon, 1.0018);
+   var p = tilePoint(lat, lon, surfaceRadius);
    positions.push(p.x, p.y, p.z);
    uvs.push(u, 1 - v);
    if (row < segments && col < segments) {
@@ -230,54 +231,56 @@ function makeTileGeometry(x, y, z) {
 function requestTile(x, y, z) {
  var key = z + "/" + x + "/" + y;
  if (tileCache.has(key)) return tileCache.get(key);
- var entry = { texture: null, loading: true };
+ var entry = { texture: null, loading: true, failed: false };
  tileCache.set(key, entry);
  var url = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/" + z + "/" + y + "/" + x;
  loader.load(url, function(texture) {
   texture.colorSpace = THREE.SRGBColorSpace || undefined;
   texture.encoding = THREE.sRGBEncoding;
   texture.anisotropy = Math.min(4, R.capabilities.getMaxAnisotropy());
+  texture.generateMipmaps = true;
+  texture.minFilter = THREE.LinearMipmapLinearFilter;
+  texture.magFilter = THREE.LinearFilter;
   entry.texture = texture;
   entry.loading = false;
-  if (entry.material) entry.material.map = texture;
-  if (entry.material) entry.material.needsUpdate = true;
  }, undefined, function() {
   entry.loading = false;
-  tileCache.delete(key);
+  entry.failed = true;
  });
  return entry;
 }
 function updateSatelliteTiles(now) {
  var radius = C.position.length();
  if (radius > 2.65) {
-  if (tileLayer.children.length) {
-   tileLayer.children.forEach(function(mesh) {
-    tileLayer.remove(mesh);
-    mesh.geometry.dispose();
-    if (mesh.material) mesh.material.dispose();
-   });
-  }
+  tileLayer.children.slice().forEach(function(mesh) {
+   tileLayer.remove(mesh);
+   mesh.geometry.dispose();
+   mesh.material.dispose();
+  });
   tileLevel = -1;
   return;
  }
  if (now < tileRefreshAt) return;
- tileRefreshAt = now + 450;
- var z = Math.max(3, Math.min(11, Math.round(5 + 3.6 * Math.log2(2.65 / radius))));
+ tileRefreshAt = now + 180;
+
+ var z = Math.max(3, Math.min(13, Math.round(5 + 5.2 * Math.log2(2.65 / radius))));
  var q = C.position.clone().normalize();
  G.updateMatrixWorld();
  q.applyQuaternion(G.quaternion.clone().invert());
- var needed = new Set();
  var n = Math.pow(2, z);
  var centerLat = Math.asin(q.y) / D2R;
  var centerLon = Math.atan2(-q.z, q.x) / D2R;
  var angular = Math.atan((radius - 1) * Math.tan(19 * D2R) * 1.8) / D2R;
  var tileSpan = 360 / n;
- var latSpan = angular + tileSpan * 1.5;
+
+ // Load a wider ring around the view so movement does not expose unloaded areas.
+ var latSpan = angular * 1.75 + tileSpan * 2;
  var lonSpan = latSpan / Math.max(.12, Math.cos(centerLat * D2R));
  var centerX = Math.floor((centerLon + 180) / 360 * n);
  var centerY = Math.floor((1 - Math.log(Math.tan(Math.PI / 4 + centerLat * D2R / 2)) / Math.PI) / 2 * n);
  var xRange = Math.ceil(lonSpan / 360 * n) + 2;
  var yRange = Math.ceil(latSpan / 180 * n) + 2;
+ var needed = [];
  for (var dy = -yRange; dy <= yRange; dy++) {
   var y = centerY + dy;
   if (y < 0 || y >= n) continue;
@@ -285,33 +288,56 @@ function updateSatelliteTiles(now) {
    var x = (centerX + dx + n) % n;
    var lat = tileLat(y + .5, z);
    var lon = (x + .5) / n * 360 - 180;
-   if (v3(lat, lon, 1).dot(q) < .05) continue;
-   needed.add(z + "/" + x + "/" + y);
+   var dot = v3(lat, lon, 1).dot(q);
+   if (dot < -0.05) continue;
+   needed.push({ key: z + "/" + x + "/" + y, x: x, y: y, dot: dot });
   }
  }
- var visibleKeys = new Set(needed);
- tileLayer.children.slice().forEach(function(mesh) {
-  if (!visibleKeys.has(mesh.userData.tileKey)) {
-   tileLayer.remove(mesh);
-   mesh.geometry.dispose();
-   if (mesh.material) mesh.material.dispose();
-  }
- });
- needed.forEach(function(key) {
-  if (tileLayer.children.some(function(mesh) { return mesh.userData.tileKey === key; })) return;
-  var parts = key.split("/").map(Number), level = parts[0], x = parts[1], y = parts[2];
-  var entry = requestTile(x, y, level);
-  // Keep the base Earth map visible until the satellite tile is ready.
-  // Never add an untextured mesh: it would render as a white patch.
-  if (!entry.texture) return;
+
+ // Center tiles are requested first; surrounding tiles are prefetched next.
+ needed.sort(function(a, b) { return b.dot - a.dot; });
+ needed.forEach(function(item) {
+  var entry = requestTile(item.x, item.y, z);
+  if (!entry.texture || entry.failed) return;
+  if (tileLayer.children.some(function(mesh) { return mesh.userData.tileKey === item.key; })) return;
   var material = new THREE.MeshBasicMaterial({
-   map: entry.texture, color: 0xffffff, side: THREE.DoubleSide
+   map: entry.texture,
+   color: 0xffffff,
+   side: THREE.DoubleSide,
+   polygonOffset: true,
+   polygonOffsetFactor: -1,
+   polygonOffsetUnits: -1
   });
-  entry.material = material;
-  var mesh = new THREE.Mesh(makeTileGeometry(x, y, level), material);
-  mesh.userData.tileKey = key;
+  var mesh = new THREE.Mesh(makeTileGeometry(item.x, item.y, z), material);
+  mesh.userData.tileKey = item.key;
+  mesh.userData.tileLevel = z;
   tileLayer.add(mesh);
  });
+
+ // Keep previously loaded imagery around the camera until replacement tiles arrive.
+ // This prevents visible holes while the user rotates or zooms the globe.
+ var keepAngle = Math.min(85, angular * 2.8 + tileSpan * 4) * D2R;
+ var keepDot = Math.cos(keepAngle);
+ tileLayer.children.slice().forEach(function(mesh) {
+  var parts = mesh.userData.tileKey.split("/").map(Number);
+  var level = parts[0], x = parts[1], y = parts[2];
+  var nLevel = Math.pow(2, level);
+  var lat = tileLat(y + .5, level);
+  var lon = (x + .5) / nLevel * 360 - 180;
+  if (v3(lat, lon, 1).dot(q) < keepDot) {
+   tileLayer.remove(mesh);
+   mesh.geometry.dispose();
+   mesh.material.dispose();
+  }
+ });
+
+ // Bound the cache so long sessions do not keep unlimited GPU textures.
+ if (tileCache.size > 1800) {
+  tileCache.forEach(function(entry, key) {
+   if (tileCache.size <= 1400) return;
+   if (!entry.loading && !entry.texture) tileCache.delete(key);
+  });
+ }
 }
 
 // High-detail terrain normal map gives mountains, ridges and valleys readable
