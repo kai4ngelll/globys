@@ -181,6 +181,136 @@ loader.load(dayTextureUrl,function(t){
  ld.classList.add("h");
 });
 
+// Satellite tiles are requested only for the visible part of the globe.
+// The original global map remains underneath while detailed tiles load.
+var tileCache = new Map();
+var tileLayer = new THREE.Group();
+G.add(tileLayer);
+var tileLevel = -1;
+var tileRotation = new THREE.Euler();
+var tileRefreshAt = 0;
+
+function tileLat(y, z) {
+ var n = Math.PI - 2 * Math.PI * y / Math.pow(2, z);
+ return Math.atan(Math.sinh(n)) * 180 / Math.PI;
+}
+function tilePoint(lat, lon, radius) {
+ return v3(lat, lon, radius);
+}
+function makeTileGeometry(x, y, z) {
+ var n = Math.pow(2, z);
+ var west = x / n * 360 - 180;
+ var east = (x + 1) / n * 360 - 180;
+ var north = tileLat(y, z);
+ var south = tileLat(y + 1, z);
+ var segments = 8, positions = [], uvs = [], indices = [];
+ for (var row = 0; row <= segments; row++) {
+  var v = row / segments;
+  var lat = north + (south - north) * v;
+  for (var col = 0; col <= segments; col++) {
+   var u = col / segments;
+   var lon = west + (east - west) * u;
+   var p = tilePoint(lat, lon, 1.0018);
+   positions.push(p.x, p.y, p.z);
+   uvs.push(u, 1 - v);
+   if (row < segments && col < segments) {
+    var a = row * (segments + 1) + col;
+    var b = a + segments + 1;
+    indices.push(a, b, a + 1, b, b + 1, a + 1);
+   }
+  }
+ }
+ var geometry = new THREE.BufferGeometry();
+ geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+ geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+ geometry.setIndex(indices);
+ geometry.computeVertexNormals();
+ return geometry;
+}
+function requestTile(x, y, z) {
+ var key = z + "/" + x + "/" + y;
+ if (tileCache.has(key)) return tileCache.get(key);
+ var entry = { texture: null, loading: true };
+ tileCache.set(key, entry);
+ var url = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/" + z + "/" + y + "/" + x;
+ loader.load(url, function(texture) {
+  texture.colorSpace = THREE.SRGBColorSpace || undefined;
+  texture.encoding = THREE.sRGBEncoding;
+  texture.anisotropy = Math.min(4, R.capabilities.getMaxAnisotropy());
+  entry.texture = texture;
+  entry.loading = false;
+  if (entry.material) entry.material.map = texture;
+  if (entry.material) entry.material.needsUpdate = true;
+ }, undefined, function() {
+  entry.loading = false;
+  tileCache.delete(key);
+ });
+ return entry;
+}
+function updateSatelliteTiles(now) {
+ var radius = C.position.length();
+ if (radius > 2.65) {
+  if (tileLayer.children.length) {
+   tileLayer.children.forEach(function(mesh) {
+    tileLayer.remove(mesh);
+    mesh.geometry.dispose();
+    if (mesh.material) mesh.material.dispose();
+   });
+  }
+  tileLevel = -1;
+  return;
+ }
+ if (now < tileRefreshAt) return;
+ tileRefreshAt = now + 450;
+ var z = Math.max(3, Math.min(11, Math.round(5 + 3.6 * Math.log2(2.65 / radius))));
+ var q = C.position.clone().normalize();
+ G.updateMatrixWorld();
+ q.applyQuaternion(G.quaternion.clone().invert());
+ var needed = new Set();
+ var n = Math.pow(2, z);
+ var centerLat = Math.asin(q.y) / D2R;
+ var centerLon = Math.atan2(-q.z, q.x) / D2R;
+ var angular = Math.atan((radius - 1) * Math.tan(19 * D2R) * 1.8) / D2R;
+ var tileSpan = 360 / n;
+ var latSpan = angular + tileSpan * 1.5;
+ var lonSpan = latSpan / Math.max(.12, Math.cos(centerLat * D2R));
+ var centerX = Math.floor((centerLon + 180) / 360 * n);
+ var centerY = Math.floor((1 - Math.log(Math.tan(Math.PI / 4 + centerLat * D2R / 2)) / Math.PI) / 2 * n);
+ var xRange = Math.ceil(lonSpan / 360 * n) + 2;
+ var yRange = Math.ceil(latSpan / 180 * n) + 2;
+ for (var dy = -yRange; dy <= yRange; dy++) {
+  var y = centerY + dy;
+  if (y < 0 || y >= n) continue;
+  for (var dx = -xRange; dx <= xRange; dx++) {
+   var x = (centerX + dx + n) % n;
+   var lat = tileLat(y + .5, z);
+   var lon = (x + .5) / n * 360 - 180;
+   if (v3(lat, lon, 1).dot(q) < .05) continue;
+   needed.add(z + "/" + x + "/" + y);
+  }
+ }
+ var visibleKeys = new Set(needed);
+ tileLayer.children.slice().forEach(function(mesh) {
+  if (!visibleKeys.has(mesh.userData.tileKey)) {
+   tileLayer.remove(mesh);
+   mesh.geometry.dispose();
+   if (mesh.material) mesh.material.dispose();
+  }
+ });
+ needed.forEach(function(key) {
+  if (tileLayer.children.some(function(mesh) { return mesh.userData.tileKey === key; })) return;
+  var parts = key.split("/").map(Number), level = parts[0], x = parts[1], y = parts[2];
+  var entry = requestTile(x, y, level);
+  var material = new THREE.MeshBasicMaterial({
+   map: entry.texture || null, color: 0xffffff, side: THREE.DoubleSide
+  });
+  entry.material = material;
+  var mesh = new THREE.Mesh(makeTileGeometry(x, y, level), material);
+  mesh.userData.tileKey = key;
+  tileLayer.add(mesh);
+ });
+}
+
 // High-detail terrain normal map gives mountains, ridges and valleys readable
 // relief under fixed, all-around daylight. A global DEM is used as an additional bump map.
 loader.load("https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/textures/planets/earth_normal_2048.jpg",function(t){
@@ -391,6 +521,7 @@ function frame(now){
  }else{
   controls.update();
  }
+ updateSatelliteTiles(now);
  R.render(S,C);
  markerClock+=dt;
  if(markerClock>=1/30 || fly){
@@ -424,6 +555,6 @@ requestAnimationFrame(frame);
 setTimeout(function(){ld.classList.add("h")},7000);
 })();
 </script>
-<div class="data-credit">Дневная текстура Земли: Solar System Scope · Рельеф: NASA ASTER GDEM · Границы: Natural Earth</div>
+<div class="data-credit">Спутниковые снимки: Esri · Дневная текстура: NASA · Рельеф: NASA ASTER GDEM · Границы: Natural Earth</div>
 </body>
 </html>
