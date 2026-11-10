@@ -301,8 +301,11 @@ function updateSatelliteTiles(now) {
   if (tileLayer.children.some(function(mesh) { return mesh.userData.tileKey === key; })) return;
   var parts = key.split("/").map(Number), level = parts[0], x = parts[1], y = parts[2];
   var entry = requestTile(x, y, level);
+  // Keep the base Earth map visible until the satellite tile is ready.
+  // Never add an untextured mesh: it would render as a white patch.
+  if (!entry.texture) return;
   var material = new THREE.MeshBasicMaterial({
-   map: entry.texture || null, color: 0xffffff, side: THREE.DoubleSide
+   map: entry.texture, color: 0xffffff, side: THREE.DoubleSide
   });
   entry.material = material;
   var mesh = new THREE.Mesh(makeTileGeometry(x, y, level), material);
